@@ -1,0 +1,1243 @@
+/*Use of AI / Cognitive Assistance Software is not allowed in any evaluation, assessment or exercise.*/
+/*=============================================================================
+	File Name:	ELNC6011VSGLAB5S.c  
+	Author:		Varun Shoury 
+	Date:		14/04/2025
+	Modified:	Varun Shoury & 25/04/2025
+	? Fanshawe College, 2024
+
+	Description: This program uses PIC18F45K22 microcontroller which is running
+	with 4Mhz oscillation, will transmit a sentence when we either press increment
+	or decrement limits. With the use of puts2USART function for the transmission.      
+=============================================================================*/
+
+/* Preprocessor ===============================================================
+   Hardware Configuration Bits ==============================================*/
+#pragma config FOSC		= INTIO67
+#pragma config PLLCFG	= OFF
+#pragma config PRICLKEN = ON
+#pragma config FCMEN	= OFF
+#pragma config IESO		= OFF
+#pragma config PWRTEN	= OFF 
+#pragma config BOREN	= ON
+#pragma config BORV		= 285 
+#pragma config WDTEN	= OFF
+#pragma config PBADEN	= OFF
+#pragma config LVP		= OFF
+#pragma config MCLRE	= EXTMCLR
+
+// Libraries ==================================================================
+#include <p18f45k22.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <usart.h>
+
+// Constants  =================================================================
+
+// boolean values 
+#define TRUE		1
+#define FALSE		0	
+// Timer related defines 
+#define ONEMINHOUR	60
+#define ONEDAY		24
+#define T0FLAG		INTCONbits.TMR0IF
+#define ONESEC		10
+#define FIVESEC		5
+// LEDs defines and LAT control
+#define LEDMASK		0x0f
+#define LEDS		LATD
+#define LEDCONTROL	LATB
+#define LIGHTING	LATCbits.LATC0
+#define	COOLER		LATCbits.LATC1
+#define HEATER		LATCbits.LATC2
+#define FAN			LATCbits.LATC3
+#define SPKLR		LATCbits.LATC4
+// pbs object defines 
+#define NOPRESS		0xF0
+#define PBMASK		0xF0
+#define MODE		0xE0
+#define CHANSEL		0xD0
+#define INC			0xB0
+#define DEC			0x70
+// sensor structure defines 
+#define SAMPSIZE	10
+#define SENCOUNT	3
+// motor defines 
+#define STEPPERMASK	0x0F
+#define STEPPERPORT	LATB
+#define PATTERNCOUNT	4
+#define STEP		3
+// mathematical calculations 
+#define VOLCONVERT	0.00488
+#define TEMPMVAL	0.01
+#define	TEMPBVAL	0.4
+#define HUMDMVAL	0.05
+#define HUMDBVAL	0
+#define CO2MVAL		0.000345833
+#define CO2BVAL		0
+// transmitter and receiver defines 
+#define BUFSIZE		35
+#define CONTROLLER	1
+#define MYADDY		157
+#define STUDENTID	157
+
+// Global Variables  ==========================================================
+typedef char flag_t;
+
+typedef struct
+{
+	int samples[SAMPSIZE];
+	int avg;
+	int upperLimit;
+	int lowerLimit;
+	int insert;
+	char avgRdy;
+} sensorCh_t;
+
+sensorCh_t sensors[SENCOUNT];
+
+typedef struct
+{
+	char currentPat;
+	char patCounter;
+	int setPos;
+	int curPos;
+	char isMoving;
+}stepper_t;
+
+stepper_t vent;
+
+typedef struct
+{
+	char chanSel;
+	char mode;
+	char pbState;
+	char lastState;
+}pbs_t;
+
+pbs_t pbs;
+
+typedef struct
+{
+	char buf[BUFSIZE];
+	flag_t senRdy;
+	int insertCount;
+}comBuf_t;
+
+comBuf_t trmt;
+
+char patterns[PATTERNCOUNT] = {0x01,0x02,0x04,0x08};
+float mTemp = 0;
+float mHumd = 0;
+float mCO2 = 0;
+char limitChanged = 0;
+char flagArr[2][5] = {"OFF","ON"};
+char modePrint[2][10] = {"HIGH","LOW"};
+char conlim[] = {"CONLIM"}; 
+
+// Functions  =================================================================
+
+/*>>> setOSC4MHZ: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will set the oscilloscope to 4Mhz.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void setOSC4MHZ(void)
+{
+	OSCCON = 0x52;				// Setting the heartbeat of the Oscillator
+	while(!OSCCONbits.HFIOFS);	// waits until  frequency is stbilized 
+} // eo setOSC4MHZ::
+
+/*>>> portConfig: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will configure the ports.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void portConfig(void)			// configuring the ports according to the usage
+{
+	ANSELA = 0x07;
+	LATA   = 0x00;
+	TRISA  = 0xff;
+
+	ANSELB = 0x00;
+	LATB   = 0xf0;
+	TRISB  = 0xf0;
+
+	ANSELC = 0x00;
+	LATC   = 0x00;
+	TRISC  = 0xf0;
+
+	ANSELD = 0x00;
+	LATD   = 0x00;
+	TRISD  = 0xff;
+
+	ANSELE = 0x00;
+	LATE   = 0x00;
+	TRISE  = 0xff;
+	
+	
+} // eo portConfig::
+
+/*>>> resetTMR0: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will reset the timer and sets the higher and lower 
+			resisters to their values.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void resetTMR0()				// function that will reset timer and sets it with H/L registers
+{
+	T0FLAG = FALSE;
+	TMR0H = 0x3C;
+ 	TMR0L = 0xB0;
+}// eo resetTMR0::
+
+/*>>> configTMR0: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will configure the timer by setting the bits.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void configTMR0()				// configuring the timer0 
+{
+	T0CON = 0x90;
+	resetTMR0();
+}// eo configTMR0::
+
+/*>>> configADC: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will set the ADC module. 
+Input: 		None 
+Returns:	None
+ ============================================================================*/
+void configADC()
+{
+	ADCON0 = 0x01;
+	ADCON1 = 0x00;
+	ADCON2 = 0x91;
+}// eo configADC::
+
+/*>>> getADCSample: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will get the ADC sample from ADC module and returns 
+			ADC result. 
+Input: 		a char type, chen. This input is required to select a channel for 
+			ADCON0.
+Returns:	an int type. A 10 bit ADC is returned.  
+ ============================================================================*/
+int getADCSample(char chan)
+{
+	ADCON0bits.CHS = chan;
+	ADCON0bits.GO = TRUE;
+	while(ADCON0bits.GO);   
+	return ADRES;
+
+}// eo getADCSample ::
+
+/*>>> sp1Config: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This fucntion will configure the serial port, by addessing baudrate,
+			 and transmitter.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void sp1Config()
+{
+	SPBRG1 = 25;
+	BAUDCON1 = 0x40;
+	RCSTA1 = 0x90;
+	TXSTA1 = 0x26;
+}// eo sp1Config::
+
+/*>>> sp2Config: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This fucntion will configure the serial port 2, by addessing baudrate,
+			receiver and transmitter.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void sp2Config()
+{
+	SPBRG2 = 12;
+	BAUDCON2 = 0x40;
+	RCSTA2 = 0x90;
+	TXSTA2 = 0x26;
+}// eo sp1Config::
+
+/*>>> initSensorCh: ===========================================================
+Author:		Varun Shoury 
+Date:		01/03/2025
+Modified:	None
+Desc:		initializes the sensorsCh type data structure with given values.
+Input: 		sensorCh_t *senPtr, this input is a pointer, it helps to goto the
+			locations of the data structure of sensorCh_t type.
+			char chID, this input is a variable which helps in going through
+			the switch cases.  
+Returns:	None. 
+ ============================================================================*/
+void initSensorCh(sensorCh_t *senPtr, char chID)
+{
+	int index = 0,initLimitIndex = 0;
+	for(index =0; index<SAMPSIZE; index++)
+	{
+		senPtr -> samples[index] = 0;
+	}
+	senPtr -> avg = 0; 
+	switch(chID)
+	{
+		case 0:
+			senPtr -> upperLimit = 35;
+			senPtr -> lowerLimit = 15;
+			break;
+		case 1: 
+			senPtr -> upperLimit = 65;
+			senPtr -> lowerLimit = 35;
+			break;
+		case 2:
+			senPtr -> upperLimit = 1400;
+			senPtr -> lowerLimit = 650;
+			break;
+		default:
+			break;
+	}
+	senPtr -> insert = 0;
+	senPtr -> avgRdy = 0;
+} // eo initSensorCh::
+
+/*>>> initStepper: ===========================================================
+Author:		Varun Shoury 
+Date:		01/03/2025
+Modified:	None
+Desc:		initialize the stepper_t data structure.
+Input: 		stepper_t *mtr, this is used to go to the locations of the data structure. 
+Returns:	None. 
+ ============================================================================*/
+void initStepper(stepper_t *mtr)
+{
+	mtr -> patCounter = FALSE;
+	mtr -> currentPat = patterns[mtr -> patCounter];
+	mtr -> curPos     = FALSE;
+	mtr -> setPos	  = FALSE;
+	mtr -> isMoving	  = FALSE;
+}// eo initStepper ::
+
+/*>>> initPB: ================================================================
+Author:		Varun Shoury
+Date:		01/03/2025
+Modified:	None
+Desc:		initialize the pbs_t type data structure. 
+Input: 		pbs_t *pbs, this input is used to goto the locations of the data 
+			structure of pbs_t type.
+Returns:	None 
+ ============================================================================*/
+void initPB(pbs_t *pbs)
+{	
+	pbs -> chanSel   = FALSE;
+	pbs -> mode	     = FALSE;
+	pbs -> pbState   = FALSE;
+	pbs -> lastState = NOPRESS;
+}// eo initPB ::
+
+/*>>> calcCheckSum: ===========================================================
+Author:		Varun Shoury 
+Date:		25/03/2025
+Modified:	None
+Desc:		This function is created to perform an Ex-or operation on a string as
+			a result it will give an unique value. 
+Input: 		char ptr, this is needed to go through an array/string. 
+Returns:	char, the return is a unique value from the ex-or operation on the data 
+			in the string passed. 
+ ==============================================================================*/
+char calcCheckSum(char *ptr)
+{
+	char checkSum = 0;
+	while(*ptr)
+	{
+		checkSum^= *ptr;
+		ptr ++;
+	}
+	return checkSum;
+}// eo calcCheckSum:: 
+
+/*>>> changeMode: ===========================================================
+Author:		varun Shoury 
+Date:		01/03/2025
+Modified:	None
+Desc:		this function  will toggle the mode. That in result is used to change 
+			limit from 1 to 0 and vive versa. 
+Input: 		None.
+Returns:	None.
+ ============================================================================*/
+void changeMode()
+{
+	pbs.mode = !pbs.mode;
+}// eo changeMode::
+
+/*>>> initTRMT: ===========================================================
+Author:		Varun Shoury
+Date:		25/03/2025
+Modified:	None
+Desc:		this function will initialize the comBuf_t type data structure
+			members. 
+Input: 		comBuf_t *ptr, this input is created to point the address of the 
+			member in data structure. 
+Returns:	None.
+ ============================================================================*/
+void initTRMT(comBuf_t *ptr)
+{
+	int index = 0;
+	for(index=0; index<BUFSIZE; index++)
+	{
+		ptr -> buf[index] = FALSE; 
+	}// eo for loop
+	ptr -> insertCount = FALSE;
+	ptr -> senRdy = FALSE;
+}// eo initEvent:: 
+
+/*>>> changeChannel: ===========================================================
+Author:		Varun Shoury 
+Date:		01/03/2025
+Modified:	None
+Desc:		This function is used to change the channel, by incrementing the chanSel
+			and keeping the variable in limit. 
+Input: 		None.
+Returns:	None. 
+ ============================================================================*/
+void changeChannel()
+{
+	pbs.chanSel ++;
+	if(pbs.chanSel >= SENCOUNT) 
+	{
+		pbs.chanSel = FALSE;
+	}
+}// eo changeChannel::
+
+/*>>> incrementLimit: ===========================================================
+Author:		Varun Shoury 
+Date:		01/03/2025
+Modified:	None
+Desc:		This function is used to increase the limit(upper and lower) using the 
+			push buttons. 
+Input: 		None.
+Returns:	None.
+ ============================================================================*/
+void incrementLimit()
+{
+	if(pbs.mode)
+	{
+		sensors[pbs.chanSel].upperLimit++;
+	}
+	else
+	{
+		sensors[pbs.chanSel].lowerLimit++;
+	}
+}// eo incrementLimit::
+
+/*>>> decrementLimit: ===========================================================
+Author:		Varun Shoury 
+Date:		01/03/2025
+Modified:	None
+Desc:		This function is used to decrease the limit(upper and lower) usisng 
+			push buttons. 
+Input: 		None.
+Returns:	None. 
+ ============================================================================*/
+void decrementLimit()
+{
+	if(pbs.mode)
+	{
+		sensors[pbs.chanSel].upperLimit--;
+	}
+	else
+	{
+		sensors[pbs.chanSel].lowerLimit--;
+	}
+}// eo decrementLimit::
+
+/*>>> createASentence: ===========================================================
+Author:		Varun Shoury 
+Date:		10/03/2025
+Modified:	/03/2025
+Desc:		This function is used to create a sentence using sprintf. 
+Input: 		None.
+Returns:	None.
+ ================================================================================*/
+void createASentence()
+{
+	if(pbs.mode)
+	{
+		// saving the base statemtment(a string) into the array buf[]. 
+		sprintf(trmt.buf,"$%s,%d,%d,%d,%d,%d",conlim,CONTROLLER,MYADDY,pbs.chanSel,pbs.mode,sensors[pbs.chanSel].upperLimit);
+	}
+	else
+	{
+		sprintf(trmt.buf,"$%s,%d,%d,%d,%d,%d",conlim,CONTROLLER,MYADDY,pbs.chanSel,pbs.mode,sensors[pbs.chanSel].lowerLimit);
+	}	
+	sprintf(trmt.buf,"%s,%d\r",trmt.buf,calcCheckSum(trmt.buf));
+	trmt.senRdy = TRUE;
+}// eo createASentence:: 
+
+/*>>> display: ===========================================================
+Author:		Varun Shoury 
+Date:		10/03/2025
+Modified:	Varun Shoury & 25/03/2025
+Desc:		This function is used to print statements to tera term. 
+Input: 		None.
+Returns:	None.
+ ================================================================================*/
+void display()
+{
+	char chID = 0;
+	int displayIndex = 0;
+	printf("\033[2J\033[H");
+	printf("Greeenhouse Controller System(%d)\n\r\n\r",STUDENTID);
+	if(pbs.mode == 0)
+	{
+		printf("channel:%d\tMode: Low\n\r\n\r",pbs.chanSel);
+	}
+	if(pbs.mode)
+	{
+		printf("channel:%d\tMode: High\n\r\n\r",pbs.chanSel);
+	}	
+	printf("Temp:\t%d%cC\tHumd:\t%d%%\tCO2:\t%dppm\t\n\r",sensors[0].avg,248,sensors[1].avg,sensors[2].avg);
+	printf("HL:\t%d%cC\t HL:\t%d\t HL:\t%dppm\n\r", sensors[0].upperLimit,248,sensors[1].upperLimit, sensors[2].upperLimit);
+	printf("LL:\t%d\t LL:\t%d\t LL:\t%dppm\n\r\n\r", sensors[0].lowerLimit,sensors[1].lowerLimit, sensors[2].lowerLimit);
+	printf("Heat:\t%s\tCool:\t%s\tFan:\t%s\n\rLights:%s\tSPKLR:%s\n\r\n\r", flagArr[HEATER],flagArr[COOLER],flagArr[FAN],flagArr[LIGHTING],flagArr[SPKLR]);
+	printf("Vent\n\r");
+	printf("Set Position:%d\tCurrent Position:%d\n\rData Pattern:0x%x\n\r\n\r",vent.setPos,vent.curPos,vent.currentPat);
+	if(limitChanged && trmt.insertCount <= FIVESEC)
+	{
+		printf("%s", trmt.buf);
+	}// eo limitchange if 
+	if(limitChanged && trmt.insertCount >= FIVESEC)
+	{
+		limitChanged = FALSE;
+	}
+}// eo display::
+
+/*>>> sysInitialize: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This fucntion will call all of the functions we made.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void sysInitialize()			
+{
+	setOSC4MHZ();
+	portConfig();
+	configTMR0();
+	sp1Config();
+	sp2Config();
+	configADC();
+}// eo sysInitialize:: 
+
+/*=== MAIN: FUNCTION ==========================================================
+ ============================================================================*/
+void main( void )
+{
+	int secCount = 0;	
+	char chID = 0;
+	sysInitialize();	  //calling all the functions in one function
+	initStepper(&vent);
+	initPB(&pbs);
+	for(chID=0; chID < SENCOUNT; chID++)	 //for loop to initialize all sensor's members to 0
+	{
+		initSensorCh(&sensors[chID], chID);		// calling initSensorCh function and giving the address of sensors array
+	}// eo for loop
+	initTRMT(&trmt);
+	while(TRUE)								//indefinite loop
+	{
+		pbs.pbState = PORTA & PBMASK;
+		if(pbs.pbState != NOPRESS && pbs.pbState != pbs.lastState)
+		{
+			pbs.lastState = pbs.pbState;
+			switch(pbs.pbState)
+			{
+				case MODE:
+						changeMode();
+						break;
+				case CHANSEL:
+						changeChannel();
+						break;
+				case INC:
+						incrementLimit();
+						limitChanged = TRUE;
+						trmt.insertCount = 0;
+						createASentence();
+						//puts2USART(trmt.buf);
+						break;
+				case DEC:
+						decrementLimit();
+						limitChanged = TRUE;
+						trmt.insertCount = 0;
+						createASentence();
+						//puts2USART(trmt.buf);
+						break;
+				default:
+						break;
+			}// eo switch case
+		}// eo if pbstate!=nopress
+  		else if(pbs.pbState == NOPRESS)
+		{
+			pbs.lastState = 0;
+		}
+
+		
+		if(T0FLAG)							//cheching if timer0 flag bit is true or not
+		{
+			resetTMR0();					// resetting the timer if flagged 
+			secCount ++;
+			if(vent.curPos != vent.setPos)
+			{
+				if(vent.curPos < vent.setPos)
+				{
+					vent.patCounter ++;                  
+					if(vent.patCounter >= PATTERNCOUNT)
+					{
+						vent.patCounter = FALSE;
+					}
+					vent.currentPat = patterns[vent.patCounter];
+					vent.curPos += STEP;
+					STEPPERPORT = STEPPERMASK & vent.currentPat;
+				}
+				else
+				{
+					vent.patCounter --;
+					if(vent.patCounter < 0)
+					{
+						vent.patCounter = PATTERNCOUNT - 1;
+					}
+					vent.currentPat = patterns[vent.patCounter];
+					vent.curPos -= STEP;
+					STEPPERPORT = STEPPERMASK & vent.currentPat;
+				}	
+			}
+			if(secCount == ONESEC)			//checking if secCount has reached the limit(ONESEC)
+			{
+				secCount = FALSE;			//making secCount zero
+				for(chID =0; chID<SENCOUNT; chID ++)
+				{	
+					sensors[chID].samples[sensors[chID].insert]= getADCSample(chID);// getting a sample from ADC module for every channel
+					sensors[chID].insert ++;	//incrementing insert
+				
+					if(sensors[chID].insert >= SAMPSIZE)//checking if insert is within the limit
+					{
+						sensors[chID].insert = FALSE;
+						sensors[chID].avgRdy = TRUE;	//making the avgrdy flag bit true if insert reaches the limit
+					}// eo if
+					if(sensors[chID].avgRdy)			
+					{
+						long sum = 0;				
+						int index = 0;
+						for(index=0; index<SAMPSIZE; index++)
+						{
+							sum+= sensors[chID].samples[index];// finding sum of the samples for each sensor
+						}// eo for loop for sum
+						sensors[chID].avg = sum/SAMPSIZE;	//finding the average
+						switch(chID)
+						{
+							case 0:
+								mTemp = ((sensors[0].avg*VOLCONVERT) - TEMPBVAL)/TEMPMVAL;
+								sensors[0].avg = mTemp;
+								break;
+							case 1:
+								mHumd = (sensors[1].avg*VOLCONVERT/HUMDMVAL);
+								sensors[1].avg = mHumd;
+								break;
+							case 2:
+								mCO2 = (sensors[2].avg*VOLCONVERT)/CO2MVAL;
+								sensors[2].avg = mCO2;
+								break;
+							default:
+								break;
+						}// eo switch 
+						// checking if temp avg is in limits, when is turn off cooler, heater, fan
+						if(sensors[0].avg > sensors[0].lowerLimit && sensors[0].avg < sensors[0].upperLimit)
+						{
+							COOLER = FALSE;							
+							HEATER = FALSE;
+							FAN = FALSE;
+						}
+						/* when temp avg is over upperlimit, cooler and fan are turned on, and position of 
+							motor is set to 90degrees. */
+						if(sensors[0].avg > sensors[0].upperLimit)
+						{
+							COOLER = TRUE;
+							HEATER = FALSE;
+							FAN = TRUE;
+							vent.setPos = 90;
+						}// eo if 			
+						if(sensors[0].avg < sensors[0].lowerLimit)
+						{
+							COOLER = FALSE;
+							HEATER = TRUE;
+							FAN = TRUE;
+							vent.setPos = 6;
+						}// eo if 
+						if(sensors[1].avg > sensors[1].lowerLimit && sensors[1].avg < sensors[1].upperLimit)
+						{
+							SPKLR = FALSE;
+						}
+						if(sensors[1].avg > sensors[1].upperLimit)
+						{
+							SPKLR = FALSE;
+							vent.setPos = 66;
+						}// eo if 			
+						if(sensors[1].avg < sensors[1].lowerLimit)
+						{
+							SPKLR = TRUE;
+							vent.setPos = 12;
+						}// eo if 
+						if(sensors[2].avg > sensors[2].upperLimit)
+						{
+							FAN = TRUE;
+							vent.setPos = 9;
+						}// eo if 
+						if(sensors[2].avg < sensors[2].lowerLimit)
+						{
+							FAN = TRUE;
+							vent.setPos = 90;
+						}// eo if 
+					}// eo avg if
+				}//eo chID for loop
+				if(trmt.senRdy)
+				{
+					trmt.senRdy = FALSE;
+					puts2USART(trmt.buf);
+				}
+				trmt.insertCount ++;
+				display();
+			}// eo if secCount is 10
+		}//eo flag if 
+	}// eo while
+} // eo main::
+
+
+/*Use of AI / Cognitive Assistance Software is not allowed in any evaluation, assessment or exercise.*/
+/*=============================================================================
+	File Name:	ELNC6011VSGLAB5C.c  
+	Author:		Varun Shoury 
+	Date:		14/04/2025
+	Modified:	Varun Shoury & 25/04/2025
+	ï¿½ Fanshawe College, 2024
+
+	Description: This program uses PIC18F45K22 microcontroller which is running
+	with 4Mhz oscillation, will receive the string from serial port 2, and displays 
+	to serial port 1, by validating, parsing and executing the string, then displaying
+	to tera term. 
+=============================================================================*/
+
+/* Preprocessor ===============================================================
+   Hardware Configuration Bits ==============================================*/
+#pragma config FOSC		= INTIO67
+#pragma config PLLCFG	= OFF
+#pragma config PRICLKEN = ON
+#pragma config FCMEN	= OFF
+#pragma config IESO		= OFF
+#pragma config PWRTEN	= OFF 
+#pragma config BOREN	= ON
+#pragma config BORV		= 285 
+#pragma config WDTEN	= OFF
+#pragma config PBADEN	= OFF
+#pragma config LVP		= OFF
+#pragma config MCLRE	= EXTMCLR
+
+// Libraries ==================================================================
+#include <p18f45k22.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <usart.h>
+#include <delays.h>
+#include <string.h>
+
+// Constants  =================================================================
+// Boolean Values
+#define TRUE		1
+#define FALSE		0	
+// Timer related defines 
+#define ONEMINHOUR	60
+#define ONEDAY		24
+#define T0FLAG		INTCONbits.TMR0IF
+#define ONESEC		10
+#define FIVESEC		5
+// LEDs defines and LAT control
+#define LEDMASK		0x0f
+#define LEDS		LATD
+#define LEDCONTROL	LATB
+#define LIGHTING	LATCbits.LATC0
+#define	COOLER		LATCbits.LATC1
+#define HEATER		LATCbits.LATC2
+#define FAN			LATCbits.LATC3
+#define SPKLR		LATCbits.LATC4
+// pbs object defines 
+#define NOPRESS		0xF0
+#define PBMASK		0xF0
+#define MODE		0xE0
+#define CHANSEL		0xD0
+#define INC			0xB0
+#define DEC			0x70
+// sensor structure defines 
+#define SAMPSIZE	10
+#define SENCOUNT	3
+// motor defines 
+#define STEPPERMASK	0x0F
+#define STEPPERPORT	LATB
+#define PATTERNCOUNT	4
+#define STEP		3
+// mathematical calculations 
+#define VOLCONVERT	0.00488
+#define TEMPMVAL	0.01
+#define	TEMPBVAL	0.4
+#define HUMDMVAL	0.05
+#define HUMDBVAL	0
+#define CO2MVAL		0.000345833
+#define CO2BVAL		0
+// transmitter and receiver defines 
+#define BUFSIZE		35
+#define CONTROLLER	1
+#define MYADDY		157
+#define STUDENTID	157
+
+#define TOKENSIZE	10
+#define RC2FLAG		PIR3bits.RC2IF
+#define RC2BYTE		RCREG2
+// #define SENSORADDY	
+
+// Prototypes =================================================================
+
+void isr();
+
+#pragma code interrupt_vector = 0x0008
+
+/*>>> interrupt_vector: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will go to assembly language and work with isr and again
+			end assembly language. 
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void interrupt_vector()
+{
+	_asm 
+		GOTO isr
+	_endasm 
+}// eo interruptVector ::
+
+#pragma code
+
+// Global Variables  ==========================================================
+
+typedef struct 
+{
+	char buf[BUFSIZE];
+	char senRdy;
+	int insert;
+}serial_t;
+serial_t rcvr2;
+
+typedef struct
+{
+	
+	int samples[SAMPSIZE];
+	int avg;
+	int upperLimit;
+	int lowerLimit;
+	int insert;
+	char avgRdy;
+	
+} sensorCh_t;
+sensorCh_t sensors[SENCOUNT];
+
+char *tokens[TOKENSIZE];
+char conlim[] = {"CONLIM"}; 
+ 
+// Functions  =================================================================
+
+/*>>> initRCVR2: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will initialize the rcvr2 object to zeroes. 
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void initRCVR2(serial_t *ptr)
+{
+	int index =0;
+	for( index=0; index<BUFSIZE; index++)
+	{
+		ptr -> buf[index] = FALSE;
+	}
+	ptr -> senRdy = FALSE;
+	ptr -> insert = FALSE;
+}
+
+/*>>> setOSC4MHZ: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will set the oscilloscope to 4Mhz.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void setOSC4MHZ(void)
+{
+	OSCCON = 0x52;				// Setting the heartbeat of the Oscillator
+	while(!OSCCONbits.HFIOFS);	// waits until  frequency is stbilized 
+} // eo setOSC4MHZ::
+
+/*>>> portConfig: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This function will configure the ports.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void portConfig(void)			// configuring the ports according to the usage
+{
+	ANSELA = 0x00;
+	LATA   = 0x00;
+	TRISA  = 0xff;
+
+	ANSELB = 0x00;
+	LATB   = 0x00;
+	TRISB  = 0xff;
+
+	ANSELC = 0x00;
+	LATC   = 0x00;
+	TRISC  = 0xff;
+
+	ANSELD = 0x00;
+	LATD   = 0x00;
+	TRISD  = 0xff;
+
+	ANSELE = 0x00;
+	LATE   = 0x00;
+	TRISE  = 0xff;
+	
+	
+} // eo portConfig::
+
+/*>>> sp1Config: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This fucntion will configure the serial port 1, by addessing baudrate,
+			receiver and transmitter.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void sp1Config()
+{
+	SPBRG1 	 = 25;
+	BAUDCON1 = 0x40;
+	RCSTA1 	 = 0x90;
+	TXSTA1	 = 0x26;
+}// eo sp1Config::
+
+/*>>> sp2Config: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This fucntion will configure the serial port 2, by addessing baudrate,
+			receiver and transmitter.
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void sp2Config()
+{
+	SPBRG2	 = 12;
+	BAUDCON2 = 0x40;
+	RCSTA2	 = 0x90;
+	TXSTA2	 = 0x26;
+}// eo sp1Config::
+
+/*>>> configINT: ===========================================================
+Author:		Varun Shoury Golluru 
+Date:		14/06/2024
+Modified:	None
+Desc:		This will configure the intcon, that is without timers. 
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void configINT()
+{
+	INTCON = 0xC0;
+	RCONbits.IPEN  = FALSE;
+	PIE3bits.RC2IE = TRUE;
+}// eo configINT:: 
+
+/*>>> calcCheckSum: ===========================================================
+Author:		Varun Shoury 
+Date:		25/03/2025
+Modified:	None
+Desc:		This function is created to perform an Ex-or operation on a string as
+			a result it will give an unique value. 
+Input: 		char ptr, this is needed to go through an array/string. 
+Returns:	char, the return is a unique value from the ex-or operation on the data 
+			in the string passed. 
+ ==============================================================================*/
+char calcCheckSum(char *ptr)
+{
+	char checkSum = 0;
+	while(*ptr)
+	{
+		checkSum ^= *ptr;
+		ptr ++;
+	}
+	return checkSum;
+}// eo calcCheckSum:: 
+
+/*>>> initSensorCh: ===========================================================
+Author:		Varun Shoury 
+Date:		01/03/2025
+Modified:	None
+Desc:		initializes the sensorsCh type data structure with given values.
+Input: 		sensorCh_t *senPtr, this input is a pointer, it helps to goto the
+			locations of the data structure of sensorCh_t type.
+			char chID, this input is a variable which helps in going through
+			the switch cases.  
+Returns:	None. 
+ ============================================================================*/
+void initSensorCh(sensorCh_t *senPtr, char chID)
+{
+	switch(chID)
+	{
+		case 0:
+			senPtr -> avg = 24;
+			senPtr -> upperLimit = 35;
+			senPtr -> lowerLimit = 15;
+			
+			break;
+		case 1: 
+			senPtr -> avg = 52; 
+			senPtr -> upperLimit = 65;
+			senPtr -> lowerLimit = 35;
+			break;
+		case 2:
+			senPtr -> avg = 865;
+			senPtr -> upperLimit = 1400;
+			senPtr -> lowerLimit = 650;
+			break;
+		default:
+			break;
+	}
+
+} // eo initSensorCh::
+
+/*>>> validateSentence: ===========================================================
+Author:		Varun Shoury
+Date:		14/04/2025
+Modified:	None
+Desc:		This function will validate the sentence when we feed the sentence to it
+			The validation is done by comparing the checksum values of the sent sentence 
+			and the new sentence which we got by separating the base sentence. 
+Input: 		char *ptr, This is a pointer used to go through the string.
+Returns:	char, the data is a boolean value giving out TRUE or FALSE.
+=============================================================================*/
+char validateSentence(char *ptr)
+{
+	char newCs = 0;
+	char rcvdCs = 0;
+	int count = strlen(ptr);
+	// isolating rcvd checkSum 
+	char csRdy = FALSE;
+	while(csRdy != TRUE)
+	{
+		if(*(ptr+count) == ',')
+		{	
+			*(ptr+count) = 0;
+			rcvdCs = atoi(ptr+count+1);
+			csRdy = TRUE;
+		}
+		count --;
+	}// eo while
+	newCs = calcCheckSum(ptr);
+	if(newCs == rcvdCs)
+	{
+		return TRUE;
+	}
+	else
+	{
+		return FALSE;
+	}
+}// eo validate Sentence ::
+
+/*>>> parseStr: ===========================================================
+Author:		Varun Shoury
+Date:		14/04/2025
+Modified:	None
+Desc:		This function will chop the string into multiple strings so that 
+			they can be worked with individually. 
+Input: 		char *ptr, it is a pointer which goes through the feeded string. 
+Returns:	None
+=============================================================================*/
+
+void parseStr(char *ptr)
+{
+	char tokenCounter = 0;
+	while(*ptr)
+	{
+		if(*ptr == '$' || *ptr == ',')
+		{
+			*ptr = 0; // forcing a null in the string 
+			tokens[tokenCounter] = ptr + 1;
+			tokenCounter ++;
+		}// eo if 
+		ptr ++;
+	}// eo while
+}// eo parseStr::
+
+/*>>> execStr: ===========================================================
+Author:		Varun Shoury
+Date:		14/04/2025
+Modified:	None
+Desc:		This function will perform comparisions in order to reach the upper 
+			and lower limits, will compare by using the tokens from parsed 
+			string. 
+Input: 		None
+Returns:	None
+ =============================================================================*/
+void execStr()
+{
+	if(strcmp(conlim,tokens[0])==0)
+	{
+		if(atoi(tokens[4]))
+		{
+			sensors[atoi(tokens[3])].upperLimit = atoi(tokens[5]);
+		}
+		else
+		{
+			sensors[atoi(tokens[3])].lowerLimit = atoi(tokens[5]);
+		}// eo else 
+	}// eo strcmp if
+}// eo execStr::
+
+/*>>> display: ===========================================================
+Author:		Varun Shoury
+Date:		14/04/2025
+Modified:	None
+Desc:		This function will print a series of statements which are called in 
+			the main. 
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void display()
+{
+	printf("\033[2J\033[H");
+	printf(" Controller (%d)\n\r\n\r",STUDENTID);	
+	printf("Temp:\t%d%cC\tHumd:\t%d%%\tCO2:\t%dppm\t\n\r",sensors[0].avg,248,sensors[1].avg,sensors[2].avg);
+	printf("HL:\t%d%cC\t HL:\t%d\t HL:\t%dppm\n\r", sensors[0].upperLimit,248,sensors[1].upperLimit, sensors[2].upperLimit);
+	printf("LL:\t%d\t LL:\t%d\t LL:\t%dppm\n\r\n\r", sensors[0].lowerLimit,sensors[1].lowerLimit, sensors[2].lowerLimit); 
+	Delay10KTCYx(100);
+}// eo display::
+
+/*>>> sysInitialize: ===========================================================
+Author:		Varun Shoury 
+Date:		14/06/2024
+Modified:	Varun Shoury & 14/04/2025
+Desc:		This fucntion will call all of the functions we made.
+Input: 		None 
+Returns:	None 
+ ==============================================================================*/
+void sysInitialize()			
+{
+	setOSC4MHZ();
+	portConfig();
+//	configTMR0();
+	sp1Config();
+	sp2Config();
+	configINT();
+	
+//	configADC();
+}// eo sysInitialize:: 
+
+/*>>> isr: ==================================================================
+Author:		Varun Shoury Golluru 
+Date:		14/04/2025
+Modified:	None
+Desc:		This fucntion will take the string byte by byte with RCREG2 and 
+			will do the service routine. 
+Input: 		None 
+Returns:	None 
+ ============================================================================*/
+void isr()
+{
+	if(RC2FLAG)
+	{
+		char hold = 0;		  	
+		hold = RC2BYTE;
+		if(hold == '$')
+		{
+			rcvr2.insert = 0;	
+		}
+		if(hold == '\r')
+		{
+			rcvr2.senRdy = TRUE;
+			hold = 0;
+		}
+		rcvr2.buf[rcvr2.insert] = hold;
+		rcvr2.insert ++;
+	}
+	INTCON |= 0xC0;
+}// eo ISR::
+
+/*=== MAIN: FUNCTION ==========================================================
+ ============================================================================*/
+void main( void )
+{
+	char chID = 0;
+	sysInitialize();
+	for(chID=0; chID < SENCOUNT; chID++)	 //for loop to initialize all sensor's members to 0
+	{
+		initSensorCh(&sensors[chID], chID);		// calling initSensorCh function and giving the address of sensors array
+	}// eo for loop
+	initRCVR2(&rcvr2);
+	while(TRUE)
+	{
+		if(rcvr2.senRdy)
+		{
+			rcvr2.senRdy = FALSE;
+			if(validateSentence(rcvr2.buf))
+			{
+				parseStr(rcvr2.buf);
+				execStr();	
+			}
+		}
+		display();
+		Delay10KTCYx(100);	
+	}		
+} // eo main::
+
+
+
+
+
+
+
+
+
+
